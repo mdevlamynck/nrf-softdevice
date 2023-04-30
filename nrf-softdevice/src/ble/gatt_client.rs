@@ -1,6 +1,7 @@
 //! Generic Attribute client. GATT clients consume functionality offered by GATT servers.
 
 use heapless::Vec;
+use nrf52840_pac::qspi::ifconfig0::READOC_A::READ2IO;
 
 use crate::ble::*;
 use crate::util::{get_flexarray, get_union_field, Portal};
@@ -488,6 +489,66 @@ pub fn try_write_without_response(conn: &Connection, handle: u16, buf: &[u8]) ->
         Err(e) => Err(e.into()),
         Ok(()) => Ok(()),
     }
+}
+
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum ReceiveNotificationError {
+    Disconnected,
+    Truncated,
+    Gatt(GattError),
+    Raw(RawError),
+}
+
+impl From<DisconnectedError> for ReceiveNotificationError {
+    fn from(_: DisconnectedError) -> Self {
+        Self::Disconnected
+    }
+}
+
+impl From<GattError> for ReceiveNotificationError {
+    fn from(err: GattError) -> Self {
+        Self::Gatt(err)
+    }
+}
+
+impl From<RawError> for ReceiveNotificationError {
+    fn from(err: RawError) -> Self {
+        Self::Raw(err)
+    }
+}
+
+pub async fn receive_notification(
+    conn: &Connection,
+    handle: &mut u16,
+    buf: &mut [u8],
+) -> Result<usize, ReceiveNotificationError> {
+    let conn_handle = conn.with_state(|state| state.check_connected())?;
+
+    portal(conn_handle)
+        .wait_many(|ble_evt| unsafe {
+            match (*ble_evt).header.evt_id as u32 {
+                raw::BLE_GAP_EVTS_BLE_GAP_EVT_DISCONNECTED => return Some(Err(ReceiveNotificationError::Disconnected)),
+                raw::BLE_GATTC_EVTS_BLE_GATTC_EVT_HVX => {
+                    let gattc_evt = match check_status(ble_evt) {
+                        Ok(evt) => evt,
+                        Err(e) => return Some(Err(e.into())),
+                    };
+                    let params = get_union_field(ble_evt, &gattc_evt.params.hvx);
+                    *handle = params.handle;
+                    let v = get_flexarray(ble_evt, &params.data, params.len as usize);
+                    let len = core::cmp::min(v.len(), buf.len());
+                    buf[..len].copy_from_slice(&v[..len]);
+
+                    if v.len() > buf.len() {
+                        return Some(Err(ReceiveNotificationError::Truncated));
+                    }
+                    Some(Ok(len))
+                }
+                _ => None,
+            }
+        })
+        .await
 }
 
 unsafe fn check_status(ble_evt: *const raw::ble_evt_t) -> Result<&'static raw::ble_gattc_evt_t, GattError> {
